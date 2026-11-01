@@ -7,16 +7,110 @@ module.exports = function (router) {
 
     router.get('/tasks', async function (req, res) {
         try {
-            var tasks = await Task.find().limit(100);
+            var where = {};
+            var sort = {};
+            var select = {};
 
-            res.status(200).json({
+            try {
+                if (req.query.where !== undefined) {
+                    where = JSON.parse(req.query.where);
+                }
+
+                if (req.query.sort !== undefined) {
+                    sort = JSON.parse(req.query.sort);
+                }
+
+                if (req.query.select !== undefined) {
+                    select = JSON.parse(req.query.select);
+                }
+            } catch (err) {
+                return res.status(400).json({
+                    message: 'Invalid JSON query parameter',
+                    data: null
+                });
+            }
+
+            function isObject(value) {
+                return value !== null &&
+                    typeof value === 'object' &&
+                    !Array.isArray(value);
+            }
+
+            if (!isObject(where) ||
+                !isObject(sort) ||
+                !isObject(select)) {
+                return res.status(400).json({
+                    message: 'Invalid query parameter',
+                    data: null
+                });
+            }
+
+            if (!Object.values(sort).every(function (value) {
+                return value === 1 || value === -1;
+            })) {
+                return res.status(400).json({
+                    message: 'Invalid sort parameter',
+                    data: null
+                });
+            }
+
+            function validNonnegativeInteger(value) {
+                return typeof value === 'string' &&
+                    /^(0|[1-9]\d*)$/.test(value) &&
+                    Number.isSafeInteger(Number(value));
+            }
+
+            var skip = req.query.skip === undefined
+                ? 0 : Number(req.query.skip);
+
+            var limit = req.query.limit === undefined
+                ? 100 : Number(req.query.limit);
+
+            if ((req.query.skip !== undefined &&
+                !validNonnegativeInteger(req.query.skip)) ||
+                (req.query.limit !== undefined &&
+                !validNonnegativeInteger(req.query.limit))) {
+                return res.status(400).json({
+                    message: 'Invalid skip or limit parameter',
+                    data: null
+                });
+            }
+
+            if (req.query.count !== undefined &&
+                req.query.count !== 'true' &&
+                req.query.count !== 'false') {
+                return res.status(400).json({
+                    message: 'Invalid count parameter',
+                    data: null
+                });
+            }
+
+            if (req.query.count === 'true') {
+                var total = await Task.countDocuments(where);
+
+                return res.status(200).json({
+                    message: 'Task count retrieved successfully',
+                    data: total
+                });
+            }
+
+            var query = Task.find(where)
+                .sort(sort)
+                .select(select)
+                .skip(skip)
+                .limit(limit);
+
+            var tasks = await query;
+
+            return res.status(200).json({
                 message: 'Tasks retrieved successfully',
                 data: tasks
             });
+
         } catch (err) {
             console.error(err);
 
-            res.status(500).json({
+            return res.status(500).json({
                 message: 'Unable to retrieve tasks',
                 data: null
             });
@@ -85,24 +179,34 @@ module.exports = function (router) {
                 }
             }
 
-            var task = new Task({
-                name: name,
-                deadline: deadline,
-                description: description === undefined ? '' : description,
-                completed: completed === undefined ? false : completed,
-                assignedUser: user ? user._id.toString() : '',
-                assignedUserName: user ? user.name : 'unassigned'
+            
+            var task;
+
+            await mongoose.connection.transaction(async function (session) {
+                task = new Task({
+                    name: name,
+                    deadline: deadline,
+                    description: description === undefined ? '' : description,
+                    completed: completed === undefined ? false : completed,
+                    assignedUser: user ? user._id.toString() : '',
+                    assignedUserName: user ? user.name : 'unassigned'
+                });
+
+                await task.save({ session: session });
+
+                if (user && !task.completed) {
+                    await User.findByIdAndUpdate(
+                        user._id,
+                        {
+                            $addToSet: {
+                                pendingTasks: task._id.toString()
+                            }
+                        },
+                        { session: session }
+                    );
+                }
             });
 
-            await task.save();
-
-            if (user && !task.completed) {
-                await User.findByIdAndUpdate(user._id, {
-                    $addToSet: {
-                        pendingTasks: task._id.toString()
-                    }
-                });
-            }
 
             return res.status(201).json({
                 message: 'Task created successfully',
@@ -195,12 +299,17 @@ module.exports = function (router) {
                 });
             }
 
-            await User.updateMany(
-                { pendingTasks: id },
-                { $pull: { pendingTasks: id } }
-            );
+            await mongoose.connection.transaction(async function (session) {
+                await User.updateMany(
+                    { pendingTasks: id },
+                    { $pull: { pendingTasks: id } },
+                    { session: session }
+                );
 
-            await Task.findByIdAndDelete(id);
+                await Task.findByIdAndDelete(id, {
+                    session: session
+                });
+            });
 
             return res.status(204).send();
         } catch (err) {
@@ -281,26 +390,37 @@ module.exports = function (router) {
                 }
             }
 
-            if (task.assignedUser) {
-                await User.findByIdAndUpdate(task.assignedUser, {
-                    $pull: { pendingTasks: task._id.toString() }
-                });
-            }
+            
+            await mongoose.connection.transaction(async function (session) {
 
-            task.name = name;
-            task.deadline = deadline;
-            task.description = description;
-            task.completed = completed;
-            task.assignedUser = newUser ? newUser._id.toString() : '';
-            task.assignedUserName = newUser ? newUser.name : 'unassigned';
+                await User.updateMany(
+                    { pendingTasks: id },
+                    { $pull: { pendingTasks: id } },
+                    { session: session }
+                );
 
-            await task.save();
+                task.name = name;
+                task.deadline = deadline;
+                task.description = description;
+                task.completed = completed;
+                task.assignedUser = newUser ? newUser._id.toString() : '';
+                task.assignedUserName = newUser ? newUser.name : 'unassigned';
 
-            if (newUser && !task.completed) {
-                await User.findByIdAndUpdate(newUser._id, {
-                    $addToSet: { pendingTasks: task._id.toString() }
-                });
-            }
+                await task.save({ session: session });
+
+                if (newUser && !task.completed) {
+                    await User.findByIdAndUpdate(
+                        newUser._id,
+                        {
+                            $addToSet: {
+                                pendingTasks: task._id.toString()
+                            }
+                        },
+                        { session: session }
+                    );
+                }
+            });
+
 
             return res.status(200).json({
                 message: 'Task updated successfully',

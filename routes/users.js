@@ -7,16 +7,121 @@ module.exports = function (router) {
 
     router.get('/users', async function (req, res) {
         try {
-            var users = await User.find();
+            var where = {};
+            var sort = {};
+            var select = {};
 
-            res.status(200).json({
+            try {
+                if (req.query.where !== undefined) {
+                    where = JSON.parse(req.query.where);
+                }
+
+                if (req.query.sort !== undefined) {
+                    sort = JSON.parse(req.query.sort);
+                }
+
+                if (req.query.select !== undefined) {
+                    select = JSON.parse(req.query.select);
+                }
+            } catch (err) {
+                return res.status(400).json({
+                    message: 'Invalid JSON query parameter',
+                    data: null
+                });
+            }
+
+            function isObject(value) {
+                return value !== null &&
+                    typeof value === 'object' &&
+                    !Array.isArray(value);
+            }
+
+            if (!isObject(where) ||
+                !isObject(sort) ||
+                !isObject(select)) {
+                return res.status(400).json({
+                    message: 'Invalid query parameter',
+                    data: null
+                });
+            }
+
+            if (!Object.values(sort).every(function (value) {
+                return value === 1 || value === -1;
+            })) {
+                return res.status(400).json({
+                    message: 'Invalid sort parameter',
+                    data: null
+                });
+            }
+
+            function validNonnegativeInteger(value) {
+                return typeof value === 'string' &&
+                    /^(0|[1-9]\d*)$/.test(value) &&
+                    Number.isSafeInteger(Number(value));
+            }
+
+            var skip = req.query.skip === undefined
+                ? 0 : Number(req.query.skip);
+
+            if (req.query.skip !== undefined &&
+                !validNonnegativeInteger(req.query.skip)) {
+                return res.status(400).json({
+                    message: 'Invalid skip parameter',
+                    data: null
+                });
+            }
+
+            var limit;
+
+            if (req.query.limit !== undefined) {
+                if (!validNonnegativeInteger(req.query.limit)) {
+                    return res.status(400).json({
+                        message: 'Invalid limit parameter',
+                        data: null
+                    });
+                }
+
+                limit = Number(req.query.limit);
+            }
+
+            if (req.query.count !== undefined &&
+                req.query.count !== 'true' &&
+                req.query.count !== 'false') {
+                return res.status(400).json({
+                    message: 'Invalid count parameter',
+                    data: null
+                });
+            }
+
+            if (req.query.count === 'true') {
+                var total = await User.countDocuments(where);
+
+                return res.status(200).json({
+                    message: 'User count retrieved successfully',
+                    data: total
+                });
+            }
+
+            var query = User.find(where)
+                .sort(sort)
+                .select(select)
+                .skip(skip);
+
+            if (limit !== undefined) {
+                query = query.limit(limit);
+            }
+
+            var users = await query;
+
+            return res.status(200).json({
                 message: 'Users retrieved successfully',
                 data: users
             });
+
         } catch (err) {
             console.error(err);
 
-            res.status(500).json({
+            return res.status(500).json({
                 message: 'Unable to retrieve users',
                 data: null
             });
@@ -27,30 +132,99 @@ module.exports = function (router) {
         try {
             var name = req.body.name;
             var email = req.body.email;
+            var pendingTasks = req.body.pendingTasks === undefined
+                ? [] : req.body.pendingTasks;
 
-            if (typeof name !== 'string' ||
-                !name.trim() ||
-                typeof email !== 'string' ||
-                !email.trim()) {
+            if (typeof name !== 'string' || !name.trim() ||
+                typeof email !== 'string' || !email.trim()) {
+                return res.status(400).json({
+                    message: 'Name and email are required',
+                    data: null
+                });
+            }
 
-                    return res.status(400).json({
-                        message: 'Name and email are required',
-                        data: null
-                    });
+            if (!Array.isArray(pendingTasks) ||
+                !pendingTasks.every(function (taskId) {
+                    return typeof taskId === 'string' &&
+                        mongoose.isObjectIdOrHexString(taskId);
+                }) ||
+                new Set(pendingTasks).size !== pendingTasks.length) {
+                return res.status(400).json({
+                    message: 'Invalid pendingTasks array',
+                    data: null
+                });
+            }
 
-                }
+            var tasks = await Task.find({
+                _id: { $in: pendingTasks }
+            });
+
+            if (tasks.length !== pendingTasks.length) {
+                return res.status(404).json({
+                    message: 'One or more tasks not found',
+                    data: null
+                });
+            }
+
+            if (tasks.some(function (task) {
+                return task.completed;
+            })) {
+                return res.status(400).json({
+                    message: 'Completed tasks cannot be pending',
+                    data: null
+                });
+            }
+
+            var duplicate = await User.findOne({ email: email });
+
+            if (duplicate) {
+                return res.status(400).json({
+                    message: 'Email already exists',
+                    data: null
+                });
+            }
+
+            var createdUser;
+
+            await mongoose.connection.transaction(async function (session) {
 
                 var user = new User({
                     name: name,
-                    email: email
+                    email: email,
+                    pendingTasks: pendingTasks
                 });
 
-                await user.save();
+                await user.save({ session: session });
 
-                res.status(201).json({
-                    message: 'User created successfully',
-                    data: user
-                });
+                await Task.updateMany(
+                    { _id: { $in: pendingTasks } },
+                    {
+                        $set: {
+                            assignedUser: user._id.toString(),
+                            assignedUserName: user.name
+                        }
+                    },
+                    { session: session }
+                );
+
+                await User.updateMany(
+                    { _id: { $ne: user._id } },
+                    {
+                        $pull: {
+                            pendingTasks: { $in: pendingTasks }
+                        }
+                    },
+                    { session: session }
+                );
+
+                createdUser = user;
+            });
+
+            return res.status(201).json({
+                message: 'User created successfully',
+                data: createdUser
+            });
+
         } catch (err) {
             console.error(err);
 
@@ -61,7 +235,7 @@ module.exports = function (router) {
                 });
             }
 
-            res.status(500).json({
+            return res.status(500).json({
                 message: 'Unable to create user',
                 data: null
             });
@@ -144,17 +318,22 @@ module.exports = function (router) {
                 });
             }
 
-            await Task.updateMany(
-                { assignedUser: id },
-                {
-                    $set: {
-                        assignedUser: '',
-                        assignedUserName: 'unassigned'
-                    }
-                }
-            );
+            await mongoose.connection.transaction(async function (session) {
+                await Task.updateMany(
+                    { assignedUser: id },
+                    {
+                        $set: {
+                            assignedUser: '',
+                            assignedUserName: 'unassigned'
+                        }
+                    },
+                    { session: session }
+                );
 
-            await User.findByIdAndDelete(id);
+                await User.findByIdAndDelete(id, {
+                    session: session
+                });
+            });
 
             return res.status(204).send();
         } catch (err) {
@@ -244,41 +423,65 @@ module.exports = function (router) {
                 });
             }
 
-            var currentlyAssigned = await Task.find({
-                assignedUser: id
-            });
+            
+            await mongoose.connection.transaction(async function (session) {
 
-            var newPendingSet = new Set(pendingTasks);
+                var currentlyAssigned = await Task.find({
+                    assignedUser: id
+                }).session(session);
 
-            for (var task of currentlyAssigned) {
-                var taskId = task._id.toString();
+                var newPendingSet = new Set(pendingTasks);
 
-                if (!task.completed && !newPendingSet.has(taskId)) {
-                    task.assignedUser = '';
-                    task.assignedUserName = 'unassigned';
-                } else {
-                    task.assignedUserName = name;
+                for (var task of currentlyAssigned) {
+                    var taskId = task._id.toString();
+
+                    if (!task.completed && !newPendingSet.has(taskId)) {
+
+                        task.assignedUser = '';
+                        task.assignedUserName = 'unassigned';
+                    } else {
+                        task.assignedUserName = name;
+                    }
+
+                    await task.save({ session: session });
                 }
 
-                await task.save();
-            }
+                await Task.updateMany(
+                    { _id: { $in: pendingTasks } },
+                    {
+                        $set: {
+                            assignedUser: id,
+                            assignedUserName: name
+                        }
+                    },
+                    { session: session }
+                );
 
-            for (var task of tasks) {
-                task.assignedUser = id;
-                task.assignedUserName = name;
-                await task.save();
-            }
+                await User.updateMany(
+                    { _id: { $ne: user._id } },
+                    {
+                        $pull: {
+                            pendingTasks: { $in: pendingTasks }
+                        }
+                    },
+                    { session: session }
+                );
 
-            await User.updateMany(
-                { _id: { $ne: user._id } },
-                { $pull: { pendingTasks: { $in: pendingTasks } } }
-            );
+                await User.updateOne(
+                    { _id: user._id },
+                    {
+                        $set: {
+                            name: name,
+                            email: email,
+                            pendingTasks: pendingTasks
+                        }
+                    },
+                    { session: session, runValidators: true }
+                );
+            });
 
-            user.name = name;
-            user.email = email;
-            user.pendingTasks = pendingTasks;
+            user = await User.findById(id);
 
-            await user.save();
 
             return res.status(200).json({
                 message: 'User updated successfully',
