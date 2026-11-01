@@ -390,6 +390,24 @@ module.exports = function (router) {
                 }
             }
 
+            if (req.body.assignedUserName !== undefined) {
+                if (typeof req.body.assignedUserName !== 'string') {
+                    return res.status(400).json({
+                        message: 'assignedUserName must be a string',
+                        data: null
+                    });
+                }
+
+                var expectedName = newUser ? newUser.name : 'unassigned';
+
+                if (req.body.assignedUserName !== expectedName) {
+                    return res.status(400).json({
+                        message: 'assignedUserName does not match assignedUser',
+                        data: null
+                    });
+                }
+            }
+
             
             await mongoose.connection.transaction(async function (session) {
 
